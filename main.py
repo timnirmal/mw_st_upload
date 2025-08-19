@@ -121,7 +121,7 @@ def enhance_image(
     return base
 
 # --------------------- UI ---------------------
-st.title("YOLOv11 — Split View with Floor-Plan Enhancers")
+st.title("MW Floor-Plans")
 left, right = st.columns([1, 1])
 
 with left:
