@@ -1,7 +1,7 @@
 # app.py — Streamlit YOLOv11 viewer with enhancements (Grayscale CLAHE + Lab-L CLAHE)
 import streamlit as st
 import numpy as np
-import cv2, random
+import cv2, random, os
 from ultralytics import YOLO
 
 st.set_page_config(page_title="YOLOv11 Floor-Plan Viewer", layout="wide")
@@ -36,6 +36,17 @@ def draw_transparent_boxes(img_bgr, boxes, alpha=0.5):
             cv2.rectangle(overlay, (x1, y1), (x2, y2), class_color(cl), thickness=-1)
     return cv2.addWeighted(overlay, float(alpha), img_bgr, 1 - float(alpha), 0.0)
 
+def draw_text_on_boxes(img_bgr, boxes, texts, text_color=(255,255,255)):
+    if boxes is None or len(boxes) == 0 or texts is None:
+        return img_bgr
+    img = img_bgr.copy()
+    xyxy = boxes.xyxy.cpu().numpy()
+    for bb, label in zip(xyxy, texts):
+        x1, y1, x2, y2 = [int(round(v)) for v in bb]
+        org = (x1 + 2, max(0, y1 - 6))
+        cv2.putText(img, str(label), org, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv2.LINE_AA)
+    return img
+
 def detections_to_text(result):
     if result.boxes is None or len(result.boxes) == 0:
         return "Detections: 0"
@@ -43,9 +54,64 @@ def detections_to_text(result):
     xyxy = result.boxes.xyxy.cpu().numpy()
     conf = result.boxes.conf.cpu().numpy()
     cls  = result.boxes.cls.cpu().numpy().astype(int)
-    lines = [f"{i:02d}. {names.get(int(c), str(int(c)))}\t{cf:.2f}\t[{int(x1)},{int(y1)},{int(x2)},{int(y2)}]"
-             for i, ((x1,y1,x2,y2), cf, c) in enumerate(zip(xyxy, conf, cls), start=1)]
+    # If IoU values were precomputed and stored in session state, include them
+    ious = st.session_state.get("_last_ious", None)
+    lines = []
+    for i, ((x1,y1,x2,y2), cf, c) in enumerate(zip(xyxy, conf, cls), start=1):
+        base = f"{i:02d}. {names.get(int(c), str(int(c)))}\t{cf:.2f}\t[{int(x1)},{int(y1)},{int(x2)},{int(y2)}]"
+        if ious is not None and i-1 < len(ious) and ious[i-1] is not None:
+            base += f"\tIoU={ious[i-1]:.2f}"
+        lines.append(base)
     return "Detections: " + str(len(lines)) + "\n" + "\n".join(lines)
+
+# --------------------- ground truth helpers ---------------------
+def load_yolo_txt_labels(label_path, img_w, img_h):
+    if not os.path.exists(label_path):
+        return []
+    boxes = []  # list of (class_id, x1,y1,x2,y2)
+    try:
+        with open(label_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) != 5:
+                    continue
+                cid = int(float(parts[0]))
+                xc, yc, bw, bh = [float(v) for v in parts[1:]]
+                x1 = int(round((xc - bw/2.0) * img_w))
+                y1 = int(round((yc - bh/2.0) * img_h))
+                x2 = int(round((xc + bw/2.0) * img_w))
+                y2 = int(round((yc + bh/2.0) * img_h))
+                boxes.append((cid, x1, y1, x2, y2))
+    except Exception:
+        return []
+    return boxes
+
+def draw_gt_boxes(img_bgr, gt_boxes):
+    if not gt_boxes:
+        return img_bgr
+    out = img_bgr.copy()
+    for cid, x1, y1, x2, y2 in gt_boxes:
+        color = class_color(cid)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness=2)
+    return out
+
+def iou_xyxy(a, b):
+    # a,b: (x1,y1,x2,y2)
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    iw = max(0, inter_x2 - inter_x1)
+    ih = max(0, inter_y2 - inter_y1)
+    inter = iw * ih
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return float(inter) / float(union)
 
 # --------------------- enhancement pipeline ---------------------
 def enhance_image(
@@ -128,6 +194,7 @@ with left:
     st.subheader("Input")
     uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
     model_path = st.text_input("Model (.pt)", value="weights/best.pt")
+    labels_dir = st.text_input("Labels folder (YOLO .txt)", value="valid/labels")
     conf = st.slider("Confidence", 0.0, 1.0, 0.25, 0.01)
     iou  = st.slider("IoU",        0.0, 1.0, 0.45, 0.01)
     alpha= st.slider("Box transparency (alpha)", 0.0, 1.0, 0.50, 0.05)
@@ -160,6 +227,9 @@ with left:
         use_invert  = st.checkbox("Invert B/W", value=False)
 
     run = st.button("Run")
+    st.markdown("---")
+    st.caption("Ground truth preview (if annotation exists)")
+    gt_image_slot = st.empty()
 
 with right:
     st.subheader("Result")
@@ -178,6 +248,55 @@ def run_once():
     if img_bgr is None:
         st.error("Failed to decode image. Try a different file.")
         return
+
+    # load ground-truth and render on left
+    img_h, img_w = img_bgr.shape[:2]
+    base_name = os.path.splitext(os.path.basename(uploaded.name))[0]
+    # primary labels dir from input, plus fallback for common misspelling "lables"
+    primary_dir = labels_dir
+    fallback_dir = labels_dir.replace("labels", "lables") if "labels" in labels_dir else None
+    candidate_paths = [os.path.join(primary_dir, base_name + ".txt")]
+    if fallback_dir:
+        candidate_paths.append(os.path.join(fallback_dir, base_name + ".txt"))
+    label_path = None
+    # 1) direct basename match
+    for p in candidate_paths:
+        if os.path.exists(p):
+            label_path = p
+            break
+    # 2) attempt fuzzy match: files like 885_png.rf.<hash>.txt for image 885.png
+    if label_path is None:
+        try:
+            if os.path.isdir(primary_dir):
+                for fname in os.listdir(primary_dir):
+                    if not fname.lower().endswith('.txt'):
+                        continue
+                    name_no_ext = os.path.splitext(fname)[0]
+                    # normalize: replace '.' in image basename with '_' and compare prefix before any '.rf'
+                    normalized_base = base_name.replace('.', '_')
+                    if name_no_ext.startswith(normalized_base + '_') or name_no_ext.startswith(normalized_base + '.'):
+                        label_path = os.path.join(primary_dir, fname)
+                        break
+        except Exception:
+            pass
+    # 3) legacy defaults
+    if label_path is None:
+        legacy = os.path.join("data", "valid", "labels", base_name + ".txt")
+        legacy_fallback = os.path.join("data", "valid", "lables", base_name + ".txt")
+        if os.path.exists(legacy):
+            label_path = legacy
+        elif os.path.exists(legacy_fallback):
+            label_path = legacy_fallback
+    gt_boxes = load_yolo_txt_labels(label_path, img_w, img_h) if label_path else []
+    gt_bgr = draw_gt_boxes(img_bgr, gt_boxes)
+    gt_rgb = cv2.cvtColor(gt_bgr, cv2.COLOR_BGR2RGB)
+    cap = f"Ground truth ({len(gt_boxes)} boxes)"
+    if not gt_boxes:
+        searched = candidate_paths
+        if 'legacy' in locals():
+            searched += [legacy, legacy_fallback]
+        cap += " — no label found (searched: " + ", ".join([os.path.normpath(p) for p in searched]) + ")"
+    gt_image_slot.image(gt_rgb, caption=cap, use_container_width=True)
 
     # enhance for visualization
     enh_bgr = enhance_image(
@@ -204,6 +323,26 @@ def run_once():
 
     # overlay transparent boxes on the *enhanced* view (clean look, no labels)
     out_bgr = draw_transparent_boxes(enh_bgr, res.boxes, alpha=float(alpha))
+
+    # compute IoU per detection against best-matching GT of same class
+    iou_texts = None
+    if res.boxes is not None and len(res.boxes):
+        det_xyxy = res.boxes.xyxy.cpu().numpy()
+        det_cls = res.boxes.cls.cpu().numpy().astype(int)
+        iou_vals = []
+        for (x1,y1,x2,y2), dc in zip(det_xyxy, det_cls):
+            best_iou = 0.0
+            for gc, gx1, gy1, gx2, gy2 in gt_boxes:
+                if gc != int(dc):
+                    continue
+                i = iou_xyxy((int(x1),int(y1),int(x2),int(y2)), (gx1,gy1,gx2,gy2))
+                if i > best_iou:
+                    best_iou = i
+            iou_vals.append(best_iou)
+        st.session_state["_last_ious"] = iou_vals
+        iou_texts = [f"IoU {v:.2f}" for v in iou_vals]
+        out_bgr = draw_text_on_boxes(out_bgr, res.boxes, iou_texts, text_color=(0,0,0))
+
     out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
 
     # show image + detections text
