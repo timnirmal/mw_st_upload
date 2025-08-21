@@ -11,9 +11,21 @@ st.set_page_config(page_title="YOLOv11 Floor-Plan Viewer", layout="wide")
 def load_model(path: str):
     return YOLO(path)
 
-def class_color(cid: int):
+def fixed_palette_color(cid: int):
+    # Fixed, distinctive palette (BGR): Red, Blue, Yellow
+    palette = [
+        (0, 0, 255),   # Red
+        (255, 0, 0),   # Blue
+        (0, 255, 255), # Yellow
+    ]
+    return palette[int(cid) % len(palette)]
+
+def random_class_color(cid: int):
     random.seed(int(cid) + 12345)
     return tuple(int(x) for x in np.array([random.randrange(60,255) for _ in range(3)]))
+
+def select_class_color(cid: int, use_fixed: bool):
+    return fixed_palette_color(cid) if use_fixed else random_class_color(cid)
 
 def ensure_odd(v: int, minv: int = 3):
     v = int(v)
@@ -26,14 +38,15 @@ def to_bgr(img):
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     return img
 
-def draw_transparent_boxes(img_bgr, boxes, alpha=0.5):
+def draw_transparent_boxes(img_bgr, boxes, alpha=0.5, color_override=None, use_fixed_colors=True):
     overlay = img_bgr.copy()
     if boxes is not None and len(boxes):
         xyxy = boxes.xyxy.cpu().numpy()
         cls  = boxes.cls.cpu().numpy().astype(int)
         for bb, cl in zip(xyxy, cls):
             x1, y1, x2, y2 = [int(round(v)) for v in bb]
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), class_color(cl), thickness=-1)
+            color = color_override if color_override is not None else select_class_color(cl, use_fixed_colors)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=-1)
     return cv2.addWeighted(overlay, float(alpha), img_bgr, 1 - float(alpha), 0.0)
 
 def draw_text_on_boxes(img_bgr, boxes, texts, text_color=(255,255,255)):
@@ -86,14 +99,21 @@ def load_yolo_txt_labels(label_path, img_w, img_h):
         return []
     return boxes
 
-def draw_gt_boxes(img_bgr, gt_boxes):
+def draw_gt_boxes(img_bgr, gt_boxes, filled=True, alpha=0.35, color_override=None, use_fixed_colors=True):
     if not gt_boxes:
         return img_bgr
-    out = img_bgr.copy()
+    if not filled:
+        out = img_bgr.copy()
+        for cid, x1, y1, x2, y2 in gt_boxes:
+            color = color_override if color_override is not None else select_class_color(cid, use_fixed_colors)
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness=2)
+        return out
+    # filled with transparency
+    overlay = img_bgr.copy()
     for cid, x1, y1, x2, y2 in gt_boxes:
-        color = class_color(cid)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness=2)
-    return out
+        color = color_override if color_override is not None else select_class_color(cid, use_fixed_colors)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=-1)
+    return cv2.addWeighted(overlay, float(alpha), img_bgr, 1 - float(alpha), 0.0)
 
 def iou_xyxy(a, b):
     # a,b: (x1,y1,x2,y2)
@@ -112,6 +132,43 @@ def iou_xyxy(a, b):
     if union <= 0:
         return 0.0
     return float(inter) / float(union)
+
+# --------------------- segmentation-like post process ---------------------
+def make_bbox_mask_without_white(img_bgr, bbox, white_thr=230):
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1, y1 = max(0,x1), max(0,y1)
+    x2, y2 = min(img_bgr.shape[1]-1, x2), min(img_bgr.shape[0]-1, y2)
+    crop = img_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None, None
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # foreground = not near white
+    mask = (gray < int(white_thr)).astype(np.uint8) * 255
+    return mask, (x1,y1,x2,y2)
+
+def estimate_thickness_map(mask):
+    # use distance transform as proxy for thickness; scale to 0-255
+    if mask is None or mask.size == 0:
+        return None
+    bin_mask = (mask > 0).astype(np.uint8)
+    dist = cv2.distanceTransform(bin_mask, cv2.DIST_L2, 3)
+    dist_norm = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return dist_norm
+
+def filter_by_average_thickness(mask, tol_pct=40):
+    if mask is None or mask.size == 0:
+        return mask
+    vals = mask[mask > 0]
+    if len(vals) == 0:
+        return mask
+    mean_t = float(np.mean(vals))
+    # keep pixels whose thickness close to mean within tolerance
+    tol = mean_t * float(tol_pct) / 100.0
+    lower, upper = max(0, mean_t - tol), mean_t + tol
+    keep = (mask >= lower) & (mask <= upper)
+    out = np.zeros_like(mask, dtype=np.uint8)
+    out[keep] = 255
+    return out
 
 # --------------------- enhancement pipeline ---------------------
 def enhance_image(
@@ -188,16 +245,20 @@ def enhance_image(
 
 # --------------------- UI ---------------------
 st.title("MW Floor-Plans")
-left, right = st.columns([1, 1])
 
-with left:
-    st.subheader("Input")
+# Controls at top
+with st.container():
+    st.subheader("Controls")
     uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
     model_path = st.text_input("Model (.pt)", value="weights/best.pt")
     labels_dir = st.text_input("Labels folder (YOLO .txt)", value="valid/labels")
-    conf = st.slider("Confidence", 0.0, 1.0, 0.25, 0.01)
-    iou  = st.slider("IoU",        0.0, 1.0, 0.45, 0.01)
-    alpha= st.slider("Box transparency (alpha)", 0.0, 1.0, 0.50, 0.05)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        conf = st.slider("Confidence", 0.0, 1.0, 0.25, 0.01)
+    with c2:
+        iou  = st.slider("IoU",        0.0, 1.0, 0.45, 0.01)
+    with c3:
+        alpha= st.slider("Box transparency (alpha)", 0.0, 1.0, 0.50, 0.05)
     detect_on_enh = st.checkbox("Run detection on enhanced image", value=True)
 
     with st.expander("Enhancements", expanded=True):
@@ -226,15 +287,29 @@ with left:
 
         use_invert  = st.checkbox("Invert B/W", value=False)
 
+    use_fixed_palette = st.checkbox("Use fixed Red/Blue/Yellow colors for classes", value=True)
+    gt_filled = st.checkbox("Fill GT boxes", value=True)
+    # Segmentation-like post-process controls
+    enable_seg = st.checkbox("Show post-processed segmentation view", value=True)
+    cseg1, cseg2 = st.columns(2)
+    with cseg1:
+        white_thr = st.slider("White removal threshold", 150, 255, 230, 1)
+    with cseg2:
+        wall_tol = st.slider("Wall width tolerance (%)", 5, 100, 40, 1)
     run = st.button("Run")
     st.markdown("---")
-    st.caption("Ground truth preview (if annotation exists)")
-    gt_image_slot = st.empty()
 
-with right:
+# Images side by side
+img_left, img_right = st.columns([1, 1])
+with img_left:
+    st.subheader("Input + Ground Truth")
+    gt_image_slot = st.empty()
+    legend_slot = st.empty()
+with img_right:
     st.subheader("Result")
     image_slot = st.empty()
     det_text_slot = st.empty()
+    seg_image_slot = st.empty()
 
 # --------------------- run pipeline ---------------------
 def run_once():
@@ -288,7 +363,7 @@ def run_once():
         elif os.path.exists(legacy_fallback):
             label_path = legacy_fallback
     gt_boxes = load_yolo_txt_labels(label_path, img_w, img_h) if label_path else []
-    gt_bgr = draw_gt_boxes(img_bgr, gt_boxes)
+    gt_bgr = draw_gt_boxes(img_bgr, gt_boxes, filled=gt_filled, use_fixed_colors=use_fixed_palette)
     gt_rgb = cv2.cvtColor(gt_bgr, cv2.COLOR_BGR2RGB)
     cap = f"Ground truth ({len(gt_boxes)} boxes)"
     if not gt_boxes:
@@ -297,6 +372,19 @@ def run_once():
             searched += [legacy, legacy_fallback]
         cap += " — no label found (searched: " + ", ".join([os.path.normpath(p) for p in searched]) + ")"
     gt_image_slot.image(gt_rgb, caption=cap, use_container_width=True)
+    # legend
+    if use_fixed_palette:
+        legend = np.ones((40, 320, 3), dtype=np.uint8) * 255
+        entries = [("Red", (0,0,255)), ("Blue", (255,0,0)), ("Yellow", (0,255,255))]
+        x = 10
+        for name, col in entries:
+            cv2.rectangle(legend, (x, 10), (x+20, 30), col, thickness=-1)
+            cv2.putText(legend, name, (x+28, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+            x += 100
+        legend_rgb = cv2.cvtColor(legend, cv2.COLOR_BGR2RGB)
+        legend_slot.image(legend_rgb, caption="Legend: class color mapping (cyclic)", use_container_width=False)
+    else:
+        legend_slot.empty()
 
     # enhance for visualization
     enh_bgr = enhance_image(
@@ -322,7 +410,7 @@ def run_once():
     res = model.predict(det_input, conf=float(conf), iou=float(iou), verbose=False)[0]
 
     # overlay transparent boxes on the *enhanced* view (clean look, no labels)
-    out_bgr = draw_transparent_boxes(enh_bgr, res.boxes, alpha=float(alpha))
+    out_bgr = draw_transparent_boxes(enh_bgr, res.boxes, alpha=float(alpha), use_fixed_colors=use_fixed_palette)
 
     # compute IoU per detection against best-matching GT of same class
     iou_texts = None
@@ -352,6 +440,27 @@ def run_once():
         value=detections_to_text(res),
         height=240,
     )
+
+    # Build segmentation-like view in a separate image
+    if enable_seg and res.boxes is not None and len(res.boxes):
+        seg_vis = np.zeros_like(enh_bgr)
+        det_xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+        det_cls  = res.boxes.cls.cpu().numpy().astype(int)
+        for (x1,y1,x2,y2), dc in zip(det_xyxy, det_cls):
+            m, (bx1,by1,bx2,by2) = make_bbox_mask_without_white(enh_bgr, (x1,y1,x2,y2), white_thr=white_thr)
+            if m is None:
+                continue
+            thick = estimate_thickness_map(m)
+            filt = filter_by_average_thickness(thick, tol_pct=int(wall_tol))
+            color = fixed_palette_color(int(dc)) if use_fixed_palette else random_class_color(int(dc))
+            # paste filtered mask as color into seg_vis
+            roi = seg_vis[by1:by2, bx1:bx2]
+            mask_bin = (filt > 0)
+            roi[mask_bin] = color
+        seg_rgb = cv2.cvtColor(seg_vis, cv2.COLOR_BGR2RGB)
+        seg_image_slot.image(seg_rgb, caption="Post-processed segmentation view", use_container_width=True)
+    else:
+        seg_image_slot.empty()
 
 # Trigger run on button click or auto-run when image changes
 if run and uploaded is not None:
